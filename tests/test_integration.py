@@ -196,6 +196,66 @@ def test_real_sync_conversation_records_full_context(
     assert "FinishObservation" in str(tool.attributes["gen_ai.tool.call.result"])
 
 
+def test_repeated_runs_share_conversation_and_preserve_growing_context(
+    tmp_path, trace_exporter: InMemorySpanExporter
+) -> None:
+    instrument()
+    conversation = make_conversation(
+        tmp_path,
+        [
+            finish_message("First request complete", "first-finish"),
+            finish_message("Follow-up complete", "second-finish"),
+        ],
+    )
+
+    conversation.send_message("Create the initial report")
+    conversation.run()
+    conversation.send_message("Verify the same report", sender="trace-auditor")
+    conversation.run()
+
+    spans = integration_spans(trace_exporter)
+    roots = sorted(
+        (span for span in spans if span.name.startswith("invoke_agent")),
+        key=lambda span: span.start_time,
+    )
+    chats = sorted(
+        (span for span in spans if span.name.startswith("chat")),
+        key=lambda span: span.start_time,
+    )
+
+    assert len(roots) == 2
+    assert len(chats) == 2
+    assert roots[0].context.trace_id != roots[1].context.trace_id
+    assert {span.attributes["gen_ai.conversation.id"] for span in spans} == {
+        str(conversation.id)
+    }
+
+    for root in roots:
+        children = [
+            span
+            for span in spans
+            if span.parent is not None and span.parent.span_id == root.context.span_id
+        ]
+        assert len(children) == 2
+        assert {span.context.trace_id for span in children} == {root.context.trace_id}
+
+    assert "Create the initial report" in str(
+        roots[0].attributes["gen_ai.input.messages"]
+    )
+    assert "Verify the same report" in str(roots[1].attributes["gen_ai.input.messages"])
+    assert "Create the initial report" in str(
+        chats[1].attributes["gen_ai.input.messages"]
+    )
+    assert "First request complete" in str(chats[1].attributes["gen_ai.input.messages"])
+    assert "Verify the same report" in str(chats[1].attributes["gen_ai.input.messages"])
+    assert "Verify the same report" not in str(
+        roots[0].attributes["weave.openhands.context.events"]
+    )
+    assert "Verify the same report" in str(
+        roots[1].attributes["weave.openhands.context.events"]
+    )
+
+
 @pytest.mark.asyncio
 async def test_real_async_conversation_has_the_same_span_contract(
     tmp_path, trace_exporter: InMemorySpanExporter

@@ -5,9 +5,12 @@ from __future__ import annotations
 import json
 import os
 from collections.abc import Sequence
+from hashlib import sha256
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Any, Self
+from typing import Any, Literal, Self
+
+from pydantic import Field
 
 from weave_openhands import finish, init
 
@@ -40,12 +43,17 @@ def main() -> None:
     from weave.trace.urls import agent_conversation_path
 
     class WorkspaceReportAction(Action):
-        title: str
-        findings: list[str]
+        operation: Literal["write", "append", "verify", "inspect"]
+        title: str = "OpenHands Weave Observability Report"
+        findings: list[str] = Field(default_factory=list)
+        required_text: str = ""
 
     class WorkspaceReportObservation(Observation):
+        operation: str
         path: str
         bytes_written: int
+        line_count: int
+        sha256: str
         source_excerpt: str
 
     class WorkspaceReportExecutor(
@@ -60,24 +68,46 @@ def main() -> None:
             conversation: Any = None,
         ) -> WorkspaceReportObservation:
             brief = (self.workspace / "brief.md").read_text()
-            report = "\n".join(
-                [
-                    f"# {action.title}",
-                    "",
-                    "## Source brief",
-                    brief.strip(),
-                    "",
-                    "## Findings",
-                    *(f"- {finding}" for finding in action.findings),
-                    "",
-                ]
-            )
             output = self.workspace / "agent_report.md"
-            output.write_text(report)
+
+            if action.operation == "write":
+                report = "\n".join(
+                    [
+                        f"# {action.title}",
+                        "",
+                        "## Source brief",
+                        brief.strip(),
+                        "",
+                        "## Findings",
+                        *(f"- {finding}" for finding in action.findings),
+                        "",
+                    ]
+                )
+                output.write_text(report)
+            elif action.operation == "append":
+                with output.open("a") as report_file:
+                    report_file.write(
+                        "".join(f"- {finding}\n" for finding in action.findings)
+                    )
+
+            report = output.read_text()
+            if action.operation == "verify" and action.required_text not in report:
+                raise ValueError(
+                    f"required text {action.required_text!r} is missing from "
+                    f"{output.name}"
+                )
+
+            report_digest = sha256(report.encode()).hexdigest()
             return WorkspaceReportObservation.from_text(
-                text=f"Created {output.name} with {len(action.findings)} findings.",
+                text=(
+                    f"{action.operation.title()} completed for {output.name}; "
+                    f"sha256={report_digest}."
+                ),
+                operation=action.operation,
                 path=output.name,
                 bytes_written=len(report.encode()),
+                line_count=len(report.splitlines()),
+                sha256=report_digest,
                 source_excerpt=brief[:120],
             )
 
@@ -104,8 +134,8 @@ def main() -> None:
             return [
                 cls(
                     description=(
-                        "Read brief.md from the workspace and create agent_report.md "
-                        "with structured findings."
+                        "Write, append, verify, or inspect agent_report.md using "
+                        "brief.md as workspace evidence."
                     ),
                     action_type=WorkspaceReportAction,
                     observation_type=WorkspaceReportObservation,
@@ -114,11 +144,36 @@ def main() -> None:
                         title="workspace_report",
                         readOnlyHint=False,
                         destructiveHint=False,
-                        idempotentHint=True,
+                        idempotentHint=False,
                         openWorldHint=False,
                     ),
                 )
             ]
+
+    def tool_calls(
+        requests: Sequence[tuple[str, dict[str, Any], str]],
+        *,
+        reasoning: str,
+    ) -> Message:
+        message = Message(
+            role="assistant",
+            content=[
+                TextContent(
+                    text="Calling " + ", ".join(name for name, _, _ in requests) + "."
+                )
+            ],
+            tool_calls=[
+                MessageToolCall(
+                    id=call_id,
+                    name=name,
+                    arguments=json.dumps(arguments, sort_keys=True),
+                    origin="completion",
+                )
+                for name, arguments, call_id in requests
+            ],
+        )
+        message.reasoning_content = reasoning
+        return message
 
     def tool_call(
         name: str,
@@ -127,20 +182,7 @@ def main() -> None:
         call_id: str,
         reasoning: str,
     ) -> Message:
-        message = Message(
-            role="assistant",
-            content=[TextContent(text=f"Calling {name}.")],
-            tool_calls=[
-                MessageToolCall(
-                    id=call_id,
-                    name=name,
-                    arguments=json.dumps(arguments, sort_keys=True),
-                    origin="completion",
-                )
-            ],
-        )
-        message.reasoning_content = reasoning
-        return message
+        return tool_calls([(name, arguments, call_id)], reasoning=reasoning)
 
     register_tool("WorkspaceReportTool", WorkspaceReportTool)
 
@@ -165,6 +207,7 @@ def main() -> None:
         tool_call(
             "workspace_report",
             {
+                "operation": "write",
                 "title": "OpenHands Weave Observability Report",
                 "findings": [
                     "The full system and dynamic context is available on agent spans.",
@@ -176,15 +219,92 @@ def main() -> None:
             reasoning="I now have the plan, skill guidance, and workspace brief.",
         ),
         tool_call(
+            "workspace_report",
+            {
+                "operation": "verify",
+                "required_text": "RECOVERY_MARKER",
+            },
+            call_id="call-expected-failure",
+            reasoning=(
+                "I should validate a requirement that is intentionally absent so "
+                "the trace records a recoverable tool failure."
+            ),
+        ),
+        tool_call(
+            "think",
+            {
+                "thought": (
+                    "The validation failed as expected. Append the missing marker, "
+                    "then complete this request."
+                )
+            },
+            call_id="call-recovery-plan",
+            reasoning="The tool error is actionable and the workspace is still valid.",
+        ),
+        tool_call(
+            "workspace_report",
+            {
+                "operation": "append",
+                "findings": [
+                    "RECOVERY_MARKER: the agent observed and repaired a failed check."
+                ],
+            },
+            call_id="call-recovery",
+            reasoning="I can satisfy the failed validation with a targeted append.",
+        ),
+        tool_call(
             "finish",
             {
                 "message": (
-                    "Created agent_report.md after planning, activating context, "
-                    "and invoking the trace-review skill."
+                    "Created agent_report.md, exercised an expected tool failure, "
+                    "and recovered by appending the required marker."
                 )
             },
-            call_id="call-finish",
-            reasoning="The requested workspace artifact is complete.",
+            call_id="call-first-finish",
+            reasoning="The first requested workspace artifact is complete.",
+        ),
+        tool_call(
+            "think",
+            {
+                "thought": (
+                    "This is a follow-up turn in the same conversation. Re-verify "
+                    "the repaired report and inspect its final metadata."
+                )
+            },
+            call_id="call-follow-up-plan",
+            reasoning="I should retain the earlier context and validate its result.",
+        ),
+        tool_calls(
+            [
+                (
+                    "workspace_report",
+                    {
+                        "operation": "verify",
+                        "required_text": "RECOVERY_MARKER",
+                    },
+                    "call-final-verify",
+                ),
+                (
+                    "workspace_report",
+                    {"operation": "inspect"},
+                    "call-final-inspect",
+                ),
+            ],
+            reasoning=(
+                "Both read-only checks target the same declared file resource, which "
+                "exercises parallel dispatch and resource locking."
+            ),
+        ),
+        tool_call(
+            "finish",
+            {
+                "message": (
+                    "Follow-up complete: the recovery marker is present and the "
+                    "final report metadata was inspected."
+                )
+            },
+            call_id="call-final-finish",
+            reasoning="The follow-up verification succeeded.",
         ),
     ]
 
@@ -251,9 +371,17 @@ def main() -> None:
             )
             conversation.run()
 
+            conversation.send_message(
+                "Follow up on the same observability task: verify the recovery marker, "
+                "inspect the final report, and finish without rewriting it.",
+                sender="trace-auditor",
+            )
+            conversation.run()
+
             report = (workspace / "agent_report.md").read_text()
             conversation_id = str(conversation.id)
             print(f"conversation_id={conversation_id}")
+            print(f"llm_turns={agent.llm.call_count}")
             print(
                 "activated_skills="
                 + ",".join(conversation.state.activated_knowledge_skills)

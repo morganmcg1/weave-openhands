@@ -69,10 +69,12 @@ queued spans immediately.
 
 ### End-to-end example
 
-[`examples/rich_agent.py`](examples/rich_agent.py) runs a deterministic, multi-step
-OpenHands agent with visible reasoning, built-in thinking and finishing, a
-progressive-disclosure skill, a keyword-triggered skill, a resource-declaring custom
-workspace tool, persisted events, callbacks, and full Weave tracing:
+[`examples/rich_agent.py`](examples/rich_agent.py) runs a deterministic, ten-turn
+OpenHands agent with visible reasoning, repeated user requests in one conversation,
+built-in thinking and finishing, progressive-disclosure and keyword-triggered
+skills, a resource-declaring custom workspace tool, persisted events, callbacks,
+and full Weave tracing. It also records an expected tool failure and recovery, then
+dispatches two final tool calls against the same declared file resource:
 
 ```bash
 uv run python examples/rich_agent.py
