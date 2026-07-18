@@ -175,21 +175,22 @@ async def _trace_async_run(conversation: Any, call: Any) -> Any:
 def _start_run(conversation: Any) -> _RunTrace:
     conversation_id = str(conversation.id)
     model = str(getattr(conversation.agent.llm, "model", ""))
+    provider = _provider_name(model)
     span = trace.get_tracer(_TRACER_NAME).start_span(
         f"invoke_agent {_config.agent_name}", context=Context()
     )
-    _set_attributes(
-        span,
-        {
-            "gen_ai.operation.name": "invoke_agent",
-            "gen_ai.agent.name": _config.agent_name,
-            "gen_ai.conversation.id": conversation_id,
-            "gen_ai.request.model": model,
-            "weave.openhands.agent.class": type(conversation.agent).__name__,
-            "weave.openhands.run.mode": "local",
-            **_integration_attributes(),
-        },
-    )
+    attrs = {
+        "gen_ai.operation.name": "invoke_agent",
+        "gen_ai.agent.name": _config.agent_name,
+        "gen_ai.conversation.id": conversation_id,
+        "gen_ai.request.model": model,
+        "weave.openhands.agent.class": type(conversation.agent).__name__,
+        "weave.openhands.run.mode": "local",
+        **_integration_attributes(),
+    }
+    if provider:
+        attrs["gen_ai.provider.name"] = provider
+    _set_attributes(span, attrs)
     run = _RunTrace(
         conversation=conversation,
         span=span,
@@ -317,6 +318,7 @@ def _start_chat_span(
     llm: Any, messages: list[Any], tools: list[Any], call_context: Any
 ) -> Span:
     model = str(getattr(llm, "model", ""))
+    provider = _provider_name(model)
     run = _current_run.get()
     parent_context = trace.set_span_in_context(run.span) if run is not None else None
     span = trace.get_tracer(_TRACER_NAME).start_span(
@@ -336,6 +338,8 @@ def _start_chat_span(
     }
     if conversation_id:
         attrs["gen_ai.conversation.id"] = conversation_id
+    if provider:
+        attrs["gen_ai.provider.name"] = provider
     _copy_request_settings(attrs, llm)
     if _config.capture_content:
         input_messages = messages_to_semconv(messages, _config)
@@ -649,20 +653,39 @@ def _usage_attributes(raw_response: Any, response: Any) -> dict[str, int]:
     output_details = _value(usage, "output_tokens_details") or _value(
         usage, "completion_tokens_details"
     )
-    cache_read = _value(input_details, "cached_tokens", 0) or _value(
-        usage, "cache_read_tokens", 0
+    cache_read = (
+        _value(input_details, "cached_tokens", 0)
+        or _value(usage, "cache_read_input_tokens", 0)
+        or _value(usage, "cache_read_tokens", 0)
     )
     reasoning = _value(output_details, "reasoning_tokens", 0) or _value(
         usage, "reasoning_tokens", 0
     )
-    cache_write = _value(usage, "cache_write_tokens", 0)
+    cache_write = _value(usage, "cache_creation_input_tokens", 0) or _value(
+        usage, "cache_write_tokens", 0
+    )
     if cache_read:
         attrs["gen_ai.usage.cache_read.input_tokens"] = int(cache_read)
     if cache_write:
         attrs["gen_ai.usage.cache_creation.input_tokens"] = int(cache_write)
     if reasoning:
-        attrs["gen_ai.usage.reasoning_tokens"] = int(reasoning)
+        attrs["gen_ai.usage.reasoning.output_tokens"] = int(reasoning)
     return attrs
+
+
+def _provider_name(model: str) -> str:
+    prefix, separator, _ = model.partition("/")
+    if separator:
+        return {
+            "azure": "azure.ai.openai",
+            "bedrock": "aws.bedrock",
+            "vertex_ai": "gcp.vertex_ai",
+        }.get(prefix, prefix)
+    if model.startswith(("gpt-", "o1", "o3", "o4")):
+        return "openai"
+    if model.startswith("claude-"):
+        return "anthropic"
+    return ""
 
 
 def _finish_reasons(raw_response: Any) -> list[str]:

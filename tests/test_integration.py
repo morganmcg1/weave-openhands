@@ -104,7 +104,12 @@ def parse_attribute(span: ReadableSpan, name: str) -> Any:
     return json.loads(str(span.attributes[name]))
 
 
-def make_conversation(tmp_path, responses: list[Message | Exception]) -> Conversation:
+def make_conversation(
+    tmp_path,
+    responses: list[Message | Exception],
+    *,
+    model: str = "test-model",
+) -> Conversation:
     skill = Skill(
         name="repository-rules",
         description="Repository-specific coding rules",
@@ -117,11 +122,32 @@ def make_conversation(tmp_path, responses: list[Message | Exception]) -> Convers
         system_message_suffix="CUSTOM SYSTEM CONTEXT",
     )
     agent = Agent(
-        llm=TestLLM.from_messages(responses, model="test-model"),
+        llm=TestLLM.from_messages(responses, model=model),
         tools=[],
         agent_context=context,
     )
     return Conversation(agent=agent, workspace=tmp_path, visualizer=None)
+
+
+def test_provider_is_standardized_on_agent_and_chat_spans(
+    tmp_path, trace_exporter: InMemorySpanExporter
+) -> None:
+    instrument()
+    conversation = make_conversation(
+        tmp_path,
+        [finish_message("Provider captured")],
+        model="anthropic/claude-haiku-4-5-20251001",
+    )
+    conversation.send_message("Capture provider metadata")
+
+    conversation.run()
+
+    spans = integration_spans(trace_exporter)
+    assert (
+        span_named(spans, "invoke_agent").attributes["gen_ai.provider.name"]
+        == "anthropic"
+    )
+    assert span_named(spans, "chat").attributes["gen_ai.provider.name"] == "anthropic"
 
 
 def assert_standard_tree(spans: list[ReadableSpan], conversation_id: str) -> None:

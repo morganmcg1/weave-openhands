@@ -19,6 +19,7 @@ classifiers = [
   "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 dependencies = [
+  "fastapi>=0.116,<1",
   "openhands-sdk>=1.36.1,<2",
   "weave>=0.53.1,<0.54",
 ]

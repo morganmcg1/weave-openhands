@@ -85,6 +85,20 @@ send it elsewhere. The example uses OpenHands' `TestLLM`, so it exercises the re
 agent/tool/event loop deterministically without a model-provider API key or model
 spend.
 
+[`examples/provider_cost_agent.py`](examples/provider_cost_agent.py) runs one real
+OpenAI agent and one real Anthropic agent, asserts that both report non-zero token
+usage and cost, and sends both traces to the same Weave project:
+
+```bash
+OPENAI_API_KEY=... ANTHROPIC_API_KEY=... \
+  uv run python examples/provider_cost_agent.py
+```
+
+The integration emits standard `gen_ai.provider.name`, `gen_ai.request.model`,
+`gen_ai.response.model`, and `gen_ai.usage.*` attributes. Weave uses the model and
+token attributes to calculate per-span and conversation-level USD costs at query
+time from its pricing table.
+
 ### Redact content
 
 Full context is useful for debugging but can contain source code, personal data,
