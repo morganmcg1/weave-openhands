@@ -67,6 +67,22 @@ ordering matters because OpenTelemetry has one process-wide tracer provider.
 Call `weave_openhands.finish()` during explicit shutdown when you need to flush
 queued spans immediately.
 
+### End-to-end example
+
+[`examples/rich_agent.py`](examples/rich_agent.py) runs a deterministic, multi-step
+OpenHands agent with visible reasoning, built-in thinking and finishing, a
+progressive-disclosure skill, a keyword-triggered skill, a resource-declaring custom
+workspace tool, persisted events, callbacks, and full Weave tracing:
+
+```bash
+uv run python examples/rich_agent.py
+```
+
+It defaults to `wandb-applied-ai-team/test-openhands-weave`; set `WEAVE_PROJECT` to
+send it elsewhere. The example uses OpenHands' `TestLLM`, so it exercises the real
+agent/tool/event loop deterministically without a model-provider API key or model
+spend.
+
 ### Redact content
 
 Full context is useful for debugging but can contain source code, personal data,
