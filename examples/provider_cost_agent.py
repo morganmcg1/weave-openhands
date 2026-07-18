@@ -51,7 +51,8 @@ def main() -> None:
                     api_key=api_key,
                     usage_id=f"provider-cost-{case.name}",
                     temperature=0,
-                    max_output_tokens=256,
+                    max_output_tokens=1_280,
+                    extended_thinking_budget=1_024,
                     num_retries=1,
                 )
                 agent = Agent(
