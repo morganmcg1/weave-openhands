@@ -57,7 +57,12 @@ def to_jsonable(value: Any, config: TracingConfig) -> Any:
     return config.transform(str(value))
 
 
-def message_to_semconv(message: Any, config: TracingConfig) -> dict[str, Any]:
+def message_to_semconv(
+    message: Any,
+    config: TracingConfig,
+    *,
+    finish_reason: str | None = None,
+) -> dict[str, Any]:
     role = str(getattr(message, "role", "user"))
     parts: list[dict[str, Any]] = []
 
@@ -70,7 +75,10 @@ def message_to_semconv(message: Any, config: TracingConfig) -> dict[str, Any]:
         if tool_call_id := getattr(message, "tool_call_id", None):
             part["id"] = config.transform(str(tool_call_id))
         parts.append(part)
-        return {"role": role, "parts": parts}
+        result = {"role": role, "parts": parts}
+        if finish_reason is not None:
+            result["finish_reason"] = config.transform(finish_reason)
+        return result
 
     reasoning = _reasoning_text(message, config)
     if reasoning:
@@ -105,7 +113,10 @@ def message_to_semconv(message: Any, config: TracingConfig) -> dict[str, Any]:
             }
         )
 
-    return {"role": role, "parts": parts}
+    result = {"role": role, "parts": parts}
+    if finish_reason is not None:
+        result["finish_reason"] = config.transform(finish_reason)
+    return result
 
 
 def messages_to_semconv(
@@ -134,8 +145,10 @@ def system_instructions(
     return instructions
 
 
-def tool_definitions(tools: Iterable[Any], config: TracingConfig) -> list[Any]:
-    definitions: list[Any] = []
+def tool_definitions(
+    tools: Iterable[Any], config: TracingConfig
+) -> list[dict[str, Any]]:
+    definitions: list[dict[str, Any]] = []
     for tool in tools:
         try:
             definition = tool.to_openai_tool(add_security_risk_prediction=True)
@@ -147,7 +160,27 @@ def tool_definitions(tools: Iterable[Any], config: TracingConfig) -> list[Any]:
                     "name": getattr(tool, "name", type(tool).__name__),
                     "description": getattr(tool, "description", ""),
                 }
-        definitions.append(to_jsonable(definition, config))
+        converted = to_jsonable(definition, config)
+        function = converted.get("function") if isinstance(converted, Mapping) else None
+        fields = function if isinstance(function, Mapping) else converted
+        if not isinstance(fields, Mapping):
+            fields = {}
+        definitions.append(
+            {
+                "type": "function",
+                "name": fields.get(
+                    "name", config.transform(str(getattr(tool, "name", "")))
+                ),
+                "description": fields.get(
+                    "description",
+                    config.transform(str(getattr(tool, "description", ""))),
+                ),
+                "parameters": fields.get(
+                    "parameters",
+                    fields.get("inputSchema", fields.get("input_schema", {})),
+                ),
+            }
+        )
     return definitions
 
 

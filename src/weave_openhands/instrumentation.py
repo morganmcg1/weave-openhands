@@ -6,7 +6,7 @@ import json
 import logging
 import threading
 import traceback
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any
@@ -216,15 +216,19 @@ def _finish_run(run: _RunTrace) -> None:
 
 def _enrich_run(run: _RunTrace) -> None:
     conversation = run.conversation
-    events = list(conversation.state.events)
-    new_events = events[run.event_count_before :]
+    events = conversation.state.events
+    event_count = len(events)
+    new_events = events[run.event_count_before : event_count]
+    status = _enum_value(conversation.state.execution_status)
+    finish_reason = _run_finish_reason(status)
     attrs: dict[str, Any] = {
         "weave.openhands.run.start_event_index": run.event_count_before,
-        "weave.openhands.run.end_event_index": len(events),
-        "weave.openhands.run.status": str(conversation.state.execution_status),
+        "weave.openhands.run.end_event_index": event_count,
+        "weave.openhands.run.status": status,
+        "gen_ai.response.finish_reasons": [finish_reason],
     }
 
-    input_message = _latest_user_message(events[: run.event_count_before])
+    input_message = _latest_user_message(events, run.event_count_before)
     if _config.capture_content and input_message is not None:
         attrs["gen_ai.input.messages"] = json_dumps(
             [message_to_semconv(input_message, _config)], _config
@@ -233,14 +237,17 @@ def _enrich_run(run: _RunTrace) -> None:
     output_messages = _output_messages(new_events)
     if _config.capture_content and output_messages:
         attrs["gen_ai.output.messages"] = json_dumps(
-            [message_to_semconv(message, _config) for message in output_messages],
+            [
+                message_to_semconv(
+                    output_messages[-1],
+                    _config,
+                    finish_reason=finish_reason,
+                )
+            ],
             _config,
         )
 
-    system_event = next(
-        (event for event in events if type(event).__name__ == "SystemPromptEvent"),
-        None,
-    )
+    system_event = _system_prompt_event(events, run.event_count_before)
     if system_event is not None:
         instructions = _system_event_instructions(system_event)
         if _config.capture_content and instructions:
@@ -253,11 +260,8 @@ def _enrich_run(run: _RunTrace) -> None:
             )
 
     attrs.update(_skill_attributes(conversation))
-    attrs["weave.openhands.context.event_count"] = len(events)
+    attrs["weave.openhands.context.event_count"] = event_count
     if _config.capture_content:
-        attrs["weave.openhands.context.events"] = json_dumps(
-            [_event_snapshot(event) for event in events], _config
-        )
         attrs["weave.openhands.run.events"] = json_dumps(
             [_event_snapshot(event) for event in new_events], _config
         )
@@ -271,15 +275,24 @@ def _wrap_llm_call(original: Any) -> Any:
     @functools.wraps(original)
     def wrapped(*args: Any, **kwargs: Any) -> Any:
         llm, messages, tools, call_context = _llm_arguments(args, kwargs)
+        metrics_baseline = _metrics_baseline(llm)
         span = _start_chat_span(llm, messages, tools, call_context)
+        otel_token = otel_context.attach(trace.set_span_in_context(span))
         try:
-            response = original(*args, **kwargs)
-            _finish_chat_span(span, response)
+            with _suppress_weave_calls():
+                response = original(*args, **kwargs)
+            _finish_chat_span(
+                span,
+                response,
+                _metrics_usage_since(llm, metrics_baseline),
+            )
             return response
         except BaseException as error:
             _record_error(span, error)
             span.end()
             raise
+        finally:
+            otel_context.detach(otel_token)
 
     return wrapped
 
@@ -288,15 +301,24 @@ def _wrap_async_llm_call(original: Any) -> Any:
     @functools.wraps(original)
     async def wrapped(*args: Any, **kwargs: Any) -> Any:
         llm, messages, tools, call_context = _llm_arguments(args, kwargs)
+        metrics_baseline = _metrics_baseline(llm)
         span = _start_chat_span(llm, messages, tools, call_context)
+        otel_token = otel_context.attach(trace.set_span_in_context(span))
         try:
-            response = await original(*args, **kwargs)
-            _finish_chat_span(span, response)
+            with _suppress_weave_calls():
+                response = await original(*args, **kwargs)
+            _finish_chat_span(
+                span,
+                response,
+                _metrics_usage_since(llm, metrics_baseline),
+            )
             return response
         except BaseException as error:
             _record_error(span, error)
             span.end()
             raise
+        finally:
+            otel_context.detach(otel_token)
 
     return wrapped
 
@@ -312,6 +334,12 @@ def _llm_arguments(
         args[4] if len(args) > 4 else getattr(llm, "_call_context", None),
     )
     return llm, list(messages or []), list(tools), call_context
+
+
+def _suppress_weave_calls() -> Any:
+    from weave.trace.context.call_context import tracing_disabled
+
+    return tracing_disabled()
 
 
 def _start_chat_span(
@@ -355,14 +383,24 @@ def _start_chat_span(
     return span
 
 
-def _finish_chat_span(span: Span, response: Any) -> None:
+def _finish_chat_span(
+    span: Span, response: Any, fallback_usage: Any | None = None
+) -> None:
     attrs: dict[str, Any] = {}
     message = getattr(response, "message", None)
+    raw_response = getattr(response, "raw_response", None)
+    finish_reasons = _finish_reasons(raw_response, message)
     if _config.capture_content and message is not None:
         attrs["gen_ai.output.messages"] = json_dumps(
-            [message_to_semconv(message, _config)], _config
+            [
+                message_to_semconv(
+                    message,
+                    _config,
+                    finish_reason=finish_reasons[0] if finish_reasons else None,
+                )
+            ],
+            _config,
         )
-    raw_response = getattr(response, "raw_response", None)
     if raw_response is not None:
         response_id = getattr(raw_response, "id", None)
         response_model = getattr(raw_response, "model", None)
@@ -370,14 +408,13 @@ def _finish_chat_span(span: Span, response: Any) -> None:
             attrs["gen_ai.response.id"] = str(response_id)
         if response_model:
             attrs["gen_ai.response.model"] = str(response_model)
-        attrs.update(_usage_attributes(raw_response, response))
-        finish_reasons = _finish_reasons(raw_response)
         if finish_reasons:
             attrs["gen_ai.response.finish_reasons"] = finish_reasons
         if _config.capture_content:
             attrs["weave.openhands.llm.raw_response"] = json_dumps(
                 raw_response, _config
             )
+    attrs.update(_usage_attributes(raw_response, fallback_usage))
     _set_attributes(span, attrs)
     span.end()
 
@@ -416,6 +453,7 @@ def _wrap_tool_execution(original: Any) -> Any:
             )
             attrs["weave.openhands.tool.action"] = json_dumps(action_event, _config)
         _set_attributes(span, attrs)
+        otel_token = otel_context.attach(trace.set_span_in_context(span))
         try:
             result = original(agent, conversation, action_event, *args, **kwargs)
             if _config.capture_content:
@@ -435,6 +473,7 @@ def _wrap_tool_execution(original: Any) -> Any:
             _record_error(span, error)
             raise
         finally:
+            otel_context.detach(otel_token)
             span.end()
 
     return wrapped
@@ -448,12 +487,23 @@ def _run_for_conversation(conversation: Any) -> _RunTrace | None:
         return _active_runs.get(id(conversation))
 
 
-def _latest_user_message(events: list[Any]) -> Any | None:
-    for event in reversed(events):
+def _latest_user_message(events: Sequence[Any], stop: int | None = None) -> Any | None:
+    end = len(events) if stop is None else min(stop, len(events))
+    for index in range(end - 1, -1, -1):
+        event = events[index]
         if type(event).__name__ != "MessageEvent":
             continue
         if getattr(event, "source", None) == "user":
             return event_message(event)
+    return None
+
+
+def _system_prompt_event(events: Sequence[Any], stop: int | None = None) -> Any | None:
+    end = len(events) if stop is None else min(stop, len(events))
+    for index in range(end):
+        event = events[index]
+        if type(event).__name__ == "SystemPromptEvent":
+            return event
     return None
 
 
@@ -623,12 +673,31 @@ def _copy_request_settings(attrs: dict[str, Any], llm: Any) -> None:
             attrs[attribute] = value
 
 
-def _usage_attributes(raw_response: Any, response: Any) -> dict[str, int]:
+def _metrics_baseline(llm: Any) -> Any:
+    return llm.metrics.get_snapshot().accumulated_token_usage
+
+
+def _metrics_usage_since(llm: Any, baseline: Any) -> Any:
+    current = llm.metrics.accumulated_token_usage
+    fields = (
+        "prompt_tokens",
+        "completion_tokens",
+        "cache_read_tokens",
+        "cache_write_tokens",
+        "reasoning_tokens",
+    )
+    return {
+        field: int(_value(current, field, 0)) - int(_value(baseline, field, 0))
+        for field in fields
+    }
+
+
+def _usage_attributes(
+    raw_response: Any, fallback_usage: Any | None = None
+) -> dict[str, int]:
     usage = getattr(raw_response, "usage", None)
     if usage is None:
-        usage = getattr(
-            getattr(response, "metrics", None), "accumulated_token_usage", None
-        )
+        usage = fallback_usage
     if usage is None:
         return {}
 
@@ -688,13 +757,36 @@ def _provider_name(model: str) -> str:
     return ""
 
 
-def _finish_reasons(raw_response: Any) -> list[str]:
+def _finish_reasons(raw_response: Any, message: Any | None = None) -> list[str]:
     reasons: list[str] = []
     for choice in getattr(raw_response, "choices", ()) or ():
         value = _value(choice, "finish_reason")
         if value:
             reasons.append(str(value))
-    return reasons
+    if reasons:
+        return reasons
+    status = _value(raw_response, "status")
+    if status and status != "completed":
+        return [str(status)]
+    if message is None:
+        return []
+    if getattr(message, "tool_calls", ()) or ():
+        return ["tool_call"]
+    return ["stop"]
+
+
+def _enum_value(value: Any) -> str:
+    return str(getattr(value, "value", value))
+
+
+def _run_finish_reason(status: str) -> str:
+    return {
+        "finished": "stop",
+        "paused": "pause",
+        "waiting_for_confirmation": "pause",
+        "error": "error",
+        "stuck": "error",
+    }.get(status, status)
 
 
 def _value(value: Any, name: str, default: Any = None) -> Any:

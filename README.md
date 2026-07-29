@@ -25,8 +25,8 @@ Content capture is on by default. The integration records:
 - every input and output message, including visible reasoning and tool calls;
 - all resolved tool schemas, tool arguments, results, summaries, and security risk;
 - available, activated, and invoked OpenHands skills;
-- the complete OpenHands event stream for the conversation and the events added by
-  each run;
+- the OpenHands events added by each run, plus cumulative event counts and run
+  boundaries;
 - model request settings, response metadata, finish reasons, and token usage;
 - errors on the root, LLM, and tool spans.
 
@@ -62,10 +62,57 @@ conversation.send_message("Fix the failing tests")
 conversation.run()
 ```
 
-`init()` initializes Weave first, then patches the OpenHands SDK boundaries. This
-ordering matters because OpenTelemetry has one process-wide tracer provider.
-Call `weave_openhands.finish()` during explicit shutdown when you need to flush
-queued spans immediately.
+`init()` imports and instruments OpenHands before initializing Weave. This preserves
+OpenHands' direct LiteLLM bindings before Weave's generic autopatching runs, avoiding
+a duplicate LiteLLM call for each `chat` span. Calls-mode tracing is also suppressed
+inside the traced model boundary so autopatched provider clients do not add another
+copy; generic LiteLLM and provider tracing remains available elsewhere in the
+process. Weave then configures the process-wide OpenTelemetry provider. Call
+`weave_openhands.finish()` during explicit shutdown when you need to flush queued
+spans immediately.
+
+### Five logging patterns
+
+[`examples/logging_showcase.py`](examples/logging_showcase.py) provides five
+deterministic ways to exercise OpenHands with Weave. Every scenario uses the real
+OpenHands agent loop with `TestLLM`, so it creates complete traces without model
+credentials or model spend:
+
+| Scenario | Demonstrates |
+| --- | --- |
+| `basic` | One `invoke_agent` trace with system instructions, user input, a model response, and the `finish` tool |
+| `multi-turn` | Separate turn traces grouped by one `gen_ai.conversation.id` |
+| `tools-and-skills` | Visible reasoning, tool definitions, arguments and results, plus available, activated, and invoked skills |
+| `error-recovery` | An errored tool span followed by a successful recovery in the same agent turn |
+| `privacy-async` | Asynchronous execution and `content_transform` redaction |
+
+Run any scenario against your Weave project:
+
+```bash
+WEAVE_PROJECT="my-team/my-project" \
+  uv run python examples/logging_showcase.py basic
+
+WEAVE_PROJECT="my-team/my-project" \
+  uv run python examples/logging_showcase.py multi-turn
+
+WEAVE_PROJECT="my-team/my-project" \
+  uv run python examples/logging_showcase.py tools-and-skills
+
+WEAVE_PROJECT="my-team/my-project" \
+  uv run python examples/logging_showcase.py error-recovery
+
+WEAVE_PROJECT="my-team/my-project" \
+  uv run python examples/logging_showcase.py privacy-async
+```
+
+The privacy scenario can also log only structural metadata—span names, timing,
+models, token counts, tool names, status, and conversation identity—without prompt
+or result content:
+
+```bash
+WEAVE_PROJECT="my-team/my-project" \
+  uv run python examples/logging_showcase.py privacy-async --metadata-only
+```
 
 ### End-to-end example
 
@@ -132,7 +179,7 @@ results are captured unless your `content_transform` removes them.
 
 | Span | Standard attributes | OpenHands detail |
 | --- | --- | --- |
-| Agent run | `gen_ai.operation.name`, `gen_ai.agent.name`, `gen_ai.conversation.id`, `gen_ai.input.messages`, `gen_ai.output.messages`, `gen_ai.system_instructions`, `gen_ai.tool.definitions` | all events, per-run events, skill state, safe agent configuration |
+| Agent run | `gen_ai.operation.name`, `gen_ai.agent.name`, `gen_ai.conversation.id`, `gen_ai.input.messages`, `gen_ai.output.messages`, `gen_ai.system_instructions`, `gen_ai.tool.definitions` | per-run events, cumulative event count, skill state, safe agent configuration |
 | LLM call | `gen_ai.operation.name`, `gen_ai.request.model`, `gen_ai.input.messages`, `gen_ai.output.messages`, `gen_ai.system_instructions`, `gen_ai.tool.definitions`, `gen_ai.usage.*` | exact raw provider response |
 | Tool call | `gen_ai.operation.name`, `gen_ai.tool.name`, `gen_ai.tool.call.id`, `gen_ai.tool.call.arguments`, `gen_ai.tool.call.result` | action event, result events, summary, security risk |
 

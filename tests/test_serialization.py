@@ -10,6 +10,7 @@ from weave_openhands.serialization import (
     messages_to_semconv,
     system_instructions,
     to_jsonable,
+    tool_definitions,
 )
 
 
@@ -62,6 +63,63 @@ def test_messages_follow_genai_semantic_conventions() -> None:
     ]
     assert converted[2]["parts"] == [
         {"type": "tool_call_response", "response": "README.md", "id": "call-1"}
+    ]
+    assert (
+        message_to_semconv(messages[2], config, finish_reason="tool_call")[
+            "finish_reason"
+        ]
+        == "tool_call"
+    )
+
+
+def test_tool_definitions_follow_the_genai_semconv_shape() -> None:
+    class OpenAITool:
+        def to_openai_tool(self, **_kwargs):
+            return {
+                "type": "function",
+                "function": {
+                    "name": "terminal",
+                    "description": "Run a command",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"command": {"type": "string"}},
+                    },
+                },
+            }
+
+    class MCPTool:
+        def to_openai_tool(self, **_kwargs):
+            raise TypeError
+
+        def to_mcp_tool(self):
+            return {
+                "name": "fetch",
+                "description": "Fetch a URL",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {"url": {"type": "string"}},
+                },
+            }
+
+    assert tool_definitions([OpenAITool(), MCPTool()], TracingConfig()) == [
+        {
+            "type": "function",
+            "name": "terminal",
+            "description": "Run a command",
+            "parameters": {
+                "type": "object",
+                "properties": {"command": {"type": "string"}},
+            },
+        },
+        {
+            "type": "function",
+            "name": "fetch",
+            "description": "Fetch a URL",
+            "parameters": {
+                "type": "object",
+                "properties": {"url": {"type": "string"}},
+            },
+        },
     ]
 
 

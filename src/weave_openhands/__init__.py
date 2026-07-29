@@ -23,15 +23,13 @@ def init(
     capture_content: bool = True,
     content_transform: ContentTransform | None = None,
 ):
-    """Initialize Weave, then instrument OpenHands.
+    """Instrument OpenHands, then initialize Weave.
 
-    Call this before constructing an OpenHands agent. Initializing Weave first is
-    important because OpenTelemetry permits only one global tracer provider.
+    Importing OpenHands first preserves its direct LiteLLM bindings before Weave's
+    generic integration autopatching runs. This integration records those model
+    calls itself, so tracing LiteLLM again would duplicate them.
     """
 
-    import weave
-
-    client = weave.init(project_name)
     instrument(
         TracingConfig(
             agent_name=agent_name,
@@ -39,7 +37,10 @@ def init(
             content_transform=content_transform,
         )
     )
-    return client
+
+    import weave
+
+    return weave.init(project_name)
 
 
 def finish(timeout_millis: int = 10_000) -> None:
