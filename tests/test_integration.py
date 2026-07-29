@@ -10,11 +10,13 @@ from openhands.sdk.llm import Message, MessageToolCall, TextContent
 from openhands.sdk.skills import Skill
 from openhands.sdk.testing import TestLLM
 from openhands.sdk.tool import Action, Observation, ToolDefinition, ToolExecutor
+from opentelemetry import trace
 from opentelemetry.sdk.trace import ReadableSpan
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
     InMemorySpanExporter,
 )
 from opentelemetry.trace import StatusCode
+from weave.trace.context.call_context import get_tracing_enabled
 
 from weave_openhands import TracingConfig, instrument, is_instrumented
 
@@ -34,7 +36,10 @@ class RaisingExecutor(ToolExecutor[RaisingAction, RaisingObservation]):
     def __call__(
         self, action: RaisingAction, conversation: Any = None
     ) -> RaisingObservation:
-        raise ValueError(f"cannot process {action.value}")
+        with trace.get_tracer("test.openhands.tool").start_as_current_span(
+            "tool internals"
+        ):
+            raise ValueError(f"cannot process {action.value}")
 
 
 class RaisingTool(ToolDefinition[RaisingAction, RaisingObservation]):
@@ -168,7 +173,7 @@ def assert_standard_tree(spans: list[ReadableSpan], conversation_id: str) -> Non
         assert span.attributes["integration.meta.package_name"] == "openhands-sdk"
 
 
-def test_real_sync_conversation_records_full_context(
+def test_real_sync_conversation_records_current_turn(
     tmp_path, trace_exporter: InMemorySpanExporter
 ) -> None:
     instrument(TracingConfig(agent_name="software-engineer"))
@@ -199,10 +204,19 @@ def test_real_sync_conversation_records_full_context(
     )
     assert "CUSTOM SYSTEM CONTEXT" in str(root.attributes["gen_ai.system_instructions"])
     assert "finish" in str(root.attributes["gen_ai.tool.definitions"])
-    assert "SystemPromptEvent" in str(root.attributes["weave.openhands.context.events"])
+    assert "weave.openhands.context.events" not in root.attributes
     assert "ActionEvent" in str(root.attributes["weave.openhands.run.events"])
     assert "Task complete" in str(root.attributes["gen_ai.output.messages"])
     assert "api_key" not in str(root.attributes["weave.openhands.agent.config"])
+    assert (
+        parse_attribute(root, "gen_ai.output.messages")[-1]["finish_reason"] == "stop"
+    )
+    assert parse_attribute(root, "gen_ai.tool.definitions")[0].keys() >= {
+        "type",
+        "name",
+        "description",
+        "parameters",
+    }
 
     assert chat.attributes is not None
     assert chat.attributes["gen_ai.operation.name"] == "chat"
@@ -213,6 +227,13 @@ def test_real_sync_conversation_records_full_context(
     assert "CUSTOM SYSTEM CONTEXT" in str(chat.attributes["gen_ai.system_instructions"])
     assert "finish-call" in str(chat.attributes["gen_ai.output.messages"])
     assert "finish" in str(chat.attributes["gen_ai.tool.definitions"])
+    assert parse_attribute(chat, "gen_ai.output.messages")[0]["finish_reason"] == "stop"
+    assert parse_attribute(chat, "gen_ai.tool.definitions")[0].keys() >= {
+        "type",
+        "name",
+        "description",
+        "parameters",
+    }
 
     assert tool.attributes is not None
     assert tool.attributes["gen_ai.operation.name"] == "execute_tool"
@@ -222,7 +243,7 @@ def test_real_sync_conversation_records_full_context(
     assert "FinishObservation" in str(tool.attributes["gen_ai.tool.call.result"])
 
 
-def test_repeated_runs_share_conversation_and_preserve_growing_context(
+def test_repeated_runs_share_conversation_without_repeating_run_payloads(
     tmp_path, trace_exporter: InMemorySpanExporter
 ) -> None:
     instrument()
@@ -274,12 +295,39 @@ def test_repeated_runs_share_conversation_and_preserve_growing_context(
     )
     assert "First request complete" in str(chats[1].attributes["gen_ai.input.messages"])
     assert "Verify the same report" in str(chats[1].attributes["gen_ai.input.messages"])
-    assert "Verify the same report" not in str(
-        roots[0].attributes["weave.openhands.context.events"]
+    assert "weave.openhands.context.events" not in roots[0].attributes
+    assert "weave.openhands.context.events" not in roots[1].attributes
+    assert "second-finish" not in str(roots[0].attributes["weave.openhands.run.events"])
+    assert "first-finish" not in str(roots[1].attributes["weave.openhands.run.events"])
+    assert "First request complete" not in str(
+        roots[1].attributes["gen_ai.output.messages"]
     )
-    assert "Verify the same report" in str(
-        roots[1].attributes["weave.openhands.context.events"]
-    )
+
+
+def test_nested_provider_spans_are_children_of_the_chat_span(
+    tmp_path, trace_exporter: InMemorySpanExporter, monkeypatch
+) -> None:
+    original = TestLLM.completion
+
+    def traced_completion(llm, *args, **kwargs):
+        assert not get_tracing_enabled()
+        with trace.get_tracer("test.provider").start_as_current_span(
+            "provider request"
+        ):
+            return original(llm, *args, **kwargs)
+
+    monkeypatch.setattr(TestLLM, "completion", traced_completion)
+    instrument()
+    conversation = make_conversation(tmp_path, [finish_message("Nested correctly")])
+    conversation.send_message("Trace the provider")
+
+    conversation.run()
+
+    spans = trace_exporter.get_finished_spans()
+    chat = span_named(integration_spans(trace_exporter), "chat")
+    provider = next(span for span in spans if span.name == "provider request")
+    assert provider.parent is not None
+    assert provider.parent.span_id == chat.context.span_id
 
 
 @pytest.mark.asyncio
@@ -331,6 +379,13 @@ def test_tool_errors_are_visible_and_do_not_break_the_trace_tree(
     assert "cannot process bad-input" in str(
         raising_span.attributes["gen_ai.tool.call.result"]
     )
+    tool_internal = next(
+        span
+        for span in trace_exporter.get_finished_spans()
+        if span.name == "tool internals"
+    )
+    assert tool_internal.parent is not None
+    assert tool_internal.parent.span_id == raising_span.context.span_id
     assert root.status.status_code is StatusCode.UNSET
 
 
