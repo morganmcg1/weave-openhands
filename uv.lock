@@ -10,10 +10,6 @@ resolution-markers = [
     "python_full_version < '3.13' and sys_platform != 'win32'",
 ]
 
-[options]
-exclude-newer = "2026-09-25T12:46:26.796224Z"
-exclude-newer-span = "P2D"
-
 [[package]]
 name = "abnf"
 version = "2.2.0"
