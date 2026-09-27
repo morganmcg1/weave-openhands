@@ -18,7 +18,7 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
 from opentelemetry.trace import StatusCode
 from weave.trace.context.call_context import get_tracing_enabled
 
-from weave_openhands import TracingConfig, instrument, is_instrumented
+from weave_openhands import TracingConfig, instrument, is_instrumented, uninstrument
 
 if TYPE_CHECKING:
     from openhands.sdk.conversation.state import ConversationState
@@ -242,6 +242,13 @@ def test_real_sync_conversation_records_current_turn(
     assert "Task complete" in str(tool.attributes["gen_ai.tool.call.arguments"])
     assert "FinishObservation" in str(tool.attributes["gen_ai.tool.call.result"])
 
+    uninstrument()
+    trace_exporter.clear()
+    conversation = make_conversation(tmp_path, [finish_message("Untraced")])
+    conversation.send_message("Run after removing instrumentation")
+    conversation.run()
+    assert integration_spans(trace_exporter) == []
+
 
 def test_repeated_runs_share_conversation_without_repeating_run_payloads(
     tmp_path, trace_exporter: InMemorySpanExporter
@@ -335,16 +342,33 @@ async def test_real_async_conversation_has_the_same_span_contract(
     tmp_path, trace_exporter: InMemorySpanExporter
 ) -> None:
     instrument()
+    instrument()
     conversation = make_conversation(tmp_path, [finish_message("Async complete")])
     conversation.send_message("Run asynchronously")
 
     await conversation.arun()
 
     spans = integration_spans(trace_exporter)
+    assert [span.name for span in spans] == [
+        "chat test-model",
+        "execute_tool finish",
+        "invoke_agent openhands",
+    ]
     assert_standard_tree(spans, str(conversation.id))
+    chat = span_named(spans, "chat")
+    assert "Run asynchronously" in str(chat.attributes["gen_ai.input.messages"])
+    assert "finish-call" in str(chat.attributes["gen_ai.output.messages"])
+    assert "finish" in str(chat.attributes["gen_ai.tool.definitions"])
     assert "Async complete" in str(
         span_named(spans, "invoke_agent").attributes["gen_ai.output.messages"]
     )
+
+    uninstrument()
+    trace_exporter.clear()
+    conversation = make_conversation(tmp_path, [finish_message("Untraced async")])
+    conversation.send_message("Run after removing instrumentation")
+    await conversation.arun()
+    assert integration_spans(trace_exporter) == []
 
 
 def test_tool_errors_are_visible_and_do_not_break_the_trace_tree(

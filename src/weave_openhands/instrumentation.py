@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import functools
 import importlib.metadata
+import inspect
 import json
 import logging
 import threading
@@ -72,20 +73,26 @@ def instrument(config: TracingConfig | None = None) -> None:
         if _patches:
             return
 
-        from openhands.sdk.agent import agent as agent_module
-        from openhands.sdk.agent import utils as agent_utils
         from openhands.sdk.agent.agent import Agent
         from openhands.sdk.conversation.impl.local_conversation import (
             LocalConversation,
         )
+        from openhands.sdk.llm import LLM
 
         _apply_patch(LocalConversation, "run", _wrap_run)
         _apply_patch(LocalConversation, "arun", _wrap_arun)
         _apply_patch(Agent, "_execute_action_event", _wrap_tool_execution)
-        _apply_patch(agent_module, "make_llm_completion", _wrap_llm_call)
-        _apply_patch(agent_module, "amake_llm_completion", _wrap_async_llm_call)
-        _apply_patch(agent_utils, "make_llm_completion", _wrap_llm_call)
-        _apply_patch(agent_utils, "amake_llm_completion", _wrap_async_llm_call)
+        if hasattr(LLM, "generate"):
+            _apply_patch(LLM, "generate", _wrap_llm_call)
+            _apply_patch(LLM, "agenerate", _wrap_async_llm_call)
+        else:
+            from openhands.sdk.agent import agent as agent_module
+            from openhands.sdk.agent import utils as agent_utils
+
+            _apply_patch(agent_module, "make_llm_completion", _wrap_llm_call)
+            _apply_patch(agent_module, "amake_llm_completion", _wrap_async_llm_call)
+            _apply_patch(agent_utils, "make_llm_completion", _wrap_llm_call)
+            _apply_patch(agent_utils, "amake_llm_completion", _wrap_async_llm_call)
 
 
 def uninstrument() -> None:
@@ -272,9 +279,13 @@ def _enrich_run(run: _RunTrace) -> None:
 
 
 def _wrap_llm_call(original: Any) -> Any:
+    signature = inspect.signature(original)
+
     @functools.wraps(original)
     def wrapped(*args: Any, **kwargs: Any) -> Any:
-        llm, messages, tools, call_context = _llm_arguments(args, kwargs)
+        llm, messages, tools, call_context = _llm_arguments(
+            signature.bind(*args, **kwargs).arguments
+        )
         metrics_baseline = _metrics_baseline(llm)
         span = _start_chat_span(llm, messages, tools, call_context)
         otel_token = otel_context.attach(trace.set_span_in_context(span))
@@ -298,9 +309,13 @@ def _wrap_llm_call(original: Any) -> Any:
 
 
 def _wrap_async_llm_call(original: Any) -> Any:
+    signature = inspect.signature(original)
+
     @functools.wraps(original)
     async def wrapped(*args: Any, **kwargs: Any) -> Any:
-        llm, messages, tools, call_context = _llm_arguments(args, kwargs)
+        llm, messages, tools, call_context = _llm_arguments(
+            signature.bind(*args, **kwargs).arguments
+        )
         metrics_baseline = _metrics_baseline(llm)
         span = _start_chat_span(llm, messages, tools, call_context)
         otel_token = otel_context.attach(trace.set_span_in_context(span))
@@ -324,16 +339,13 @@ def _wrap_async_llm_call(original: Any) -> Any:
 
 
 def _llm_arguments(
-    args: tuple[Any, ...], kwargs: dict[str, Any]
+    arguments: Mapping[str, Any],
 ) -> tuple[Any, list[Any], list[Any], Any]:
-    llm = kwargs.get("llm", args[0] if args else None)
-    messages = kwargs.get("messages", args[1] if len(args) > 1 else [])
-    tools = kwargs.get("tools", args[2] if len(args) > 2 else None) or []
-    call_context = kwargs.get(
-        "call_context",
-        args[4] if len(args) > 4 else getattr(llm, "_call_context", None),
-    )
-    return llm, list(messages or []), list(tools), call_context
+    llm = arguments.get("llm", arguments.get("self"))
+    messages = arguments.get("messages") or []
+    tools = arguments.get("tools") or []
+    call_context = arguments.get("call_context", getattr(llm, "_call_context", None))
+    return llm, list(messages), list(tools), call_context
 
 
 def _suppress_weave_calls() -> Any:

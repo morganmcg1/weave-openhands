@@ -43,6 +43,8 @@ pip install "weave-openhands @ git+https://github.com/morganmcg1/weave-openhands
 ```
 
 Python 3.12, 3.13, and 3.14 are supported.
+CI tests OpenHands SDK 1.36.1 and 1.49.6 on each Python version. Tracing uses the
+SDK's generation methods when available and its legacy completion helpers otherwise.
 
 ## Use
 
