@@ -42,7 +42,7 @@ This repository is not yet published to PyPI. Install it directly from GitHub:
 pip install "weave-openhands @ git+https://github.com/morganmcg1/weave-openhands.git"
 ```
 
-Python 3.12 and 3.13 are supported.
+Python 3.12, 3.13, and 3.14 are supported.
 
 ## Use
 
